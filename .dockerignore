@@ -1,0 +1,9 @@
+**/target
+**/node_modules
+dashboard
+load-tests
+.env
+.env.*
+.git
+.idea
+.vscode

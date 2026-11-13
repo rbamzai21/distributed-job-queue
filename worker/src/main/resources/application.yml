@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: worker
+  main:
+    keep-alive: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/jobqueue}
+    username: ${DB_USER:jobqueue}
+    password: ${DB_PASSWORD:jobqueue}
+    hikari:
+      # One connection for the claim loop plus one per in-flight job finishing up.
+      maximum-pool-size: ${WORKER_DB_POOL_SIZE:10}
+
+worker:
+  concurrency: ${WORKER_CONCURRENCY:8}
+  batch-size: 10
+  poll-interval: 500ms
+  lease-duration: 30s
+  heartbeat-interval: 10s
+  reaper-interval: 5s
+  backoff-base: 1s
+  backoff-max: 5m
+  shutdown-timeout: 30s

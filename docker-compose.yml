@@ -1,0 +1,54 @@
+x-db-env: &db-env
+  DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-jobqueue}
+  DB_USER: ${POSTGRES_USER:-jobqueue}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-jobqueue}
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jobqueue}
+      POSTGRES_USER: ${POSTGRES_USER:-jobqueue}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jobqueue}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      args:
+        MODULE: api
+    environment: *db-env
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      args:
+        MODULE: worker
+    environment:
+      <<: *db-env
+      WORKER_CONCURRENCY: 8
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started  # the API runs the migrations
+    deploy:
+      replicas: 2
+    # Must exceed worker.shutdown-timeout so in-flight jobs can finish on SIGTERM.
+    stop_grace_period: 40s
+
+volumes:
+  pgdata:
