@@ -5,7 +5,7 @@ and a pool of worker processes claims and runs them. Failed jobs retry with expo
 jobs that keep failing move to a dead-letter queue for inspection. Think of it as a small SQS or Celery.
 
 **Stack:** Java 21, Spring Boot 3, PostgreSQL 17, Redis 7, Flyway, Micrometer + Prometheus,
-Docker Compose, JUnit + Testcontainers, k6.
+React + TypeScript (Vite), Docker Compose, JUnit + Testcontainers, k6.
 
 ## Architecture
 
@@ -27,6 +27,7 @@ In the default `postgres` mode there is no Redis step: workers poll Postgres wit
 | `common/` | `Job` model, row mapping, backoff calculation, the Redis ready-queue index |
 | `api/` | REST endpoints; runs the Flyway migrations on startup |
 | `worker/` | Claim loop and claim sources (Postgres / Redis), handlers, leases, reaper, retry/dead-letter logic |
+| `dashboard/` | React + TypeScript dashboard, served by nginx, which also proxies `/api` to the API |
 | `db/migrations/` | Flyway SQL migrations |
 | `load-tests/` | k6 load script and the benchmark harness |
 
@@ -38,6 +39,12 @@ Requires Docker. Nothing else needs to be installed locally.
 docker compose up -d --build                     # Postgres polling: Postgres, Redis, API on :8080, 2 workers
 QUEUE_MODE=redis docker compose up -d --build    # Redis fast path
 ```
+
+The dashboard runs at [localhost:3000](http://localhost:3000). It shows the queue at a glance (ready
+backlog and its age, running jobs, throughput, dead-letter count, latency percentiles), a live table of
+recent jobs filterable by status, the dead-letter queue with per-job and bulk **Retry**, and a form for
+enqueueing demo jobs. It polls every 2–3s, never overlaps requests, and pauses while the tab is hidden.
+For frontend work with hot reload (needs Node 20+): `cd dashboard && npm install && npm run dev`.
 
 ```bash
 curl -X POST localhost:8080/jobs -H 'Content-Type: application/json' -H 'Idempotency-Key: order-42' \
@@ -236,4 +243,5 @@ constraint change instead of `ALTER TYPE`.
 - [x] Week 2a: lease heartbeats, reaper, fencing tokens, graceful lease release, idempotency keys, cancel/retry
 - [x] Week 2b: Testcontainers crash and concurrency tests, Micrometer + Prometheus metrics, `GET /stats`
 - [x] Week 3a: Redis fast path with Postgres fallback, k6 load tests, Redis vs. Postgres benchmark
-- [ ] Week 3b: React dashboard, AWS deploy (with Postgres on its own host, to measure real scaling)
+- [x] Week 3b: React dashboard
+- [ ] Week 3c: AWS deploy (with Postgres on its own host, to measure real scaling)

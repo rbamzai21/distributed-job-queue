@@ -76,6 +76,13 @@ services:
     # Must exceed worker.shutdown-timeout so in-flight jobs can finish on SIGTERM.
     stop_grace_period: 40s
 
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
   prometheus:
     image: prom/prometheus:v3.5.0
     volumes:
