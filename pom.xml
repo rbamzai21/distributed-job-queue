@@ -26,6 +26,8 @@
 
     <properties>
         <java.version>21</java.version>
+        <!-- Boot 3.5.6 ships 1.21.3, which Docker Engine 29+ rejects for using a too-old API version. -->
+        <testcontainers.version>1.21.4</testcontainers.version>
     </properties>
 
     <dependencyManagement>

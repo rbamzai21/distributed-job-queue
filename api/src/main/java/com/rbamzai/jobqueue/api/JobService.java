@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.rbamzai.jobqueue.common.Job;
 import com.rbamzai.jobqueue.common.JobStatus;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -17,9 +19,20 @@ public class JobService {
     static final int DEFAULT_MAX_ATTEMPTS = 5;
 
     private final JobRepository repository;
+    private final Counter created;
+    private final Counter replayed;
 
-    public JobService(JobRepository repository) {
+    public JobService(JobRepository repository, MeterRegistry registry) {
         this.repository = repository;
+        this.created = enqueueCounter(registry, "created");
+        this.replayed = enqueueCounter(registry, "replayed");
+    }
+
+    private static Counter enqueueCounter(MeterRegistry registry, String result) {
+        return Counter.builder("jobqueue.jobs.enqueued")
+                .description("POST /jobs results; replayed means an Idempotency-Key matched an existing job")
+                .tag("result", result)
+                .register(registry);
     }
 
     /** {@code created} is false when an earlier request with the same idempotency key already made the job. */
@@ -34,6 +47,7 @@ public class JobService {
         Optional<Job> inserted =
                 repository.insert(request.type(), payload.toString(), priority, maxAttempts, delaySeconds, idempotencyKey);
         if (inserted.isPresent()) {
+            created.increment();
             return new EnqueueResult(inserted.get(), true);
         }
 
@@ -48,6 +62,7 @@ public class JobService {
         if (!sameRequest) {
             throw new JobConflictException("Idempotency-Key '" + idempotencyKey + "' was already used for a different job");
         }
+        replayed.increment();
         return new EnqueueResult(existing, false);
     }
 

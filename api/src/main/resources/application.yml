@@ -15,4 +15,13 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: api
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
+jobqueue:
+  stats-refresh-interval: 5s

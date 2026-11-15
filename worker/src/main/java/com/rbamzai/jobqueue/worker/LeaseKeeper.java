@@ -30,13 +30,16 @@ public class LeaseKeeper {
 
     private final JobStore store;
     private final WorkerProperties properties;
+    private final WorkerMetrics metrics;
     private final Set<UUID> heldLeases = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("lease-heartbeat").factory());
 
-    public LeaseKeeper(JobStore store, WorkerProperties properties) {
+    public LeaseKeeper(JobStore store, WorkerProperties properties, WorkerMetrics metrics) {
         this.store = store;
         this.properties = properties;
+        this.metrics = metrics;
+        metrics.registerInFlight(heldLeases, Set::size);
     }
 
     public void start() {
@@ -72,6 +75,7 @@ public class LeaseKeeper {
             // A job that finished between the snapshot and the update is no longer held, so it isn't lost.
             long lost = leases.stream().filter(id -> !extended.contains(id) && heldLeases.contains(id)).count();
             if (lost > 0) {
+                metrics.recordLeasesLost(lost);
                 log.warn("{} lease(s) were reaped before this heartbeat; those jobs may run again elsewhere", lost);
             }
         } catch (DataAccessException e) {

@@ -20,9 +20,11 @@ public class LeaseReaper {
     private static final int BATCH_SIZE = 100;
 
     private final JobStore store;
+    private final WorkerMetrics metrics;
 
-    public LeaseReaper(JobStore store) {
+    public LeaseReaper(JobStore store, WorkerMetrics metrics) {
         this.store = store;
+        this.metrics = metrics;
     }
 
     @Scheduled(fixedDelayString = "${worker.reaper-interval}", initialDelayString = "${worker.reaper-interval}")
@@ -33,8 +35,10 @@ public class LeaseReaper {
                 reaped = store.reapExpiredLeases(BATCH_SIZE);
                 if (!reaped.isEmpty()) {
                     long dead = reaped.stream().filter(job -> job.status() == JobStatus.DEAD).count();
+                    long requeued = reaped.size() - dead;
+                    metrics.recordReaped(requeued, dead);
                     log.warn("Reaped {} job(s) with expired leases: {} requeued, {} dead-lettered",
-                            reaped.size(), reaped.size() - dead, dead);
+                            reaped.size(), requeued, dead);
                 }
             } while (reaped.size() == BATCH_SIZE);
         } catch (DataAccessException e) {

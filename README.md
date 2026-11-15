@@ -4,7 +4,8 @@ A distributed job queue built from scratch: a REST API accepts jobs, PostgreSQL 
 and a pool of worker processes claims and runs them. Failed jobs retry with exponential backoff, and
 jobs that keep failing move to a dead-letter queue for inspection. Think of it as a small SQS or Celery.
 
-**Stack:** Java 21, Spring Boot 3, PostgreSQL 17, Flyway, Docker Compose, JUnit.
+**Stack:** Java 21, Spring Boot 3, PostgreSQL 17, Flyway, Micrometer + Prometheus, Docker Compose,
+JUnit + Testcontainers.
 
 ## Architecture
 
@@ -46,11 +47,42 @@ curl "localhost:8080/jobs?status=DEAD"
 | `POST /jobs/{id}/cancel` | Cancel a `PENDING` job (409 otherwise) |
 | `POST /jobs/{id}/retry` | Rerun a `DEAD` job with a fresh attempt budget (409 otherwise) |
 
-Run the unit tests without a local JDK:
+| Endpoint | |
+|---|---|
+| `GET /stats` | Depth by status, ready backlog and its oldest age, jobs finished in the last minute, enqueue-to-success p50/p95/p99 over 5 minutes. Cached and refreshed every 5s. |
+
+Prometheus runs at [localhost:9090](http://localhost:9090) and scrapes the API and every worker replica.
+Useful queries:
+
+```promql
+sum by (type, outcome) (rate(jobqueue_job_execution_seconds_count[1m]))                    # throughput
+histogram_quantile(0.99, sum by (le) (rate(jobqueue_job_queue_wait_seconds_bucket[1m])))  # p99 wait to be claimed
+histogram_quantile(0.99, sum by (le) (rate(jobqueue_claim_latency_seconds_bucket[1m])))   # p99 claim query
+jobqueue_jobs_depth                                                                        # backlog by status
+```
+
+## Tests
+
+Without a local JDK, run everything in a Maven container. The Docker socket is mounted so
+Testcontainers can start Postgres next to it:
 
 ```bash
-docker run --rm -v "$PWD:/src" -v jobqueue-m2:/root/.m2 -w /src maven:3.9-eclipse-temurin-21 mvn -B test
+docker run --rm -v "$PWD:/src" -v jobqueue-m2:/root/.m2 -v /var/run/docker.sock:/var/run/docker.sock \
+  -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal -w /src maven:3.9-eclipse-temurin-21 mvn -B verify
 ```
+
+`mvn test` runs only the unit tests; `mvn verify` adds the integration tests (`*IT`), which run against
+a real Postgres 17 with the production migrations. Each simulated worker is the real claim loop,
+heartbeat and reaper with its own connection pool, so one can be crashed without affecting the others.
+
+| Test | Proves |
+|---|---|
+| `manyWorkersRunEveryJobExactlyOnce` | 4 workers × 1,000 jobs: every job succeeds, each executes exactly once, the load spreads across workers |
+| `jobsSurviveAWorkerCrashingMidRun` | Cut a worker's database connections mid-job: all its jobs are reaped and completed by another worker. Each ran twice, which is at-least-once delivery in action |
+| `gracefulShutdownFinishesShortJobsAndReleasesLongOnes` | On stop, short jobs finish; long ones get their leases released and are rerun immediately elsewhere; late results from interrupted handlers are fenced off |
+| `staleWorkerCannotHeartbeatOrFinishAJobThatWasReclaimed` | A worker that stalls past its lease can't extend or overwrite the new owner's run, even when the same worker reclaims the job |
+| `claimSkipsRowsLockedByAnotherTransactionInsteadOfBlocking` | `SKIP LOCKED` skips a row locked by another transaction instead of waiting on it |
+| `reaperDeadLettersJobsThatAreOutOfAttempts` | A job that keeps killing its worker ends up in the DLQ instead of looping forever |
 
 ## Design decisions
 
@@ -102,6 +134,12 @@ rest of the queue for other workers.
 finish. Jobs still running after the 30s shutdown timeout get their leases released, so other workers
 rerun them immediately instead of waiting for the leases to expire.
 
+**Metrics that aggregate across workers.** Timers publish histograms rather than per-process
+percentiles, because percentiles from different workers can't be averaged; Prometheus computes fleet-wide
+p99s with `histogram_quantile`. Job types come from API clients, so only registered handler types become
+metric tags (anything else is `unknown`); otherwise each typo would create a new time series. Queue wait
+is measured as `claimed_at − run_at` using database timestamps, so worker clock skew can't distort it.
+
 **Status as `TEXT` + `CHECK`** instead of a Postgres `ENUM`: same safety, and adding a status is a
 constraint change instead of `ALTER TYPE`.
 
@@ -109,5 +147,5 @@ constraint change instead of `ALTER TYPE`.
 
 - [x] Week 1: schema, enqueue/get/list API, `SKIP LOCKED` claim loop, handlers, backoff, dead-letter queue, Compose
 - [x] Week 2a: lease heartbeats, reaper, fencing tokens, graceful lease release, idempotency keys, cancel/retry
-- [ ] Week 2b: Testcontainers crash and concurrency tests, Micrometer metrics
+- [x] Week 2b: Testcontainers crash and concurrency tests, Micrometer + Prometheus metrics, `GET /stats`
 - [ ] Week 3: Redis fast path, Redis vs. Postgres claiming benchmark, k6 load tests, React dashboard, AWS deploy

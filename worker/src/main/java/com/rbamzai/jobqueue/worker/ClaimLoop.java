@@ -30,6 +30,7 @@ public class ClaimLoop implements SmartLifecycle {
     private final JobRunner runner;
     private final LeaseKeeper leases;
     private final WorkerProperties properties;
+    private final WorkerMetrics metrics;
     private final String workerId;
     private final Semaphore slots;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -39,11 +40,17 @@ public class ClaimLoop implements SmartLifecycle {
     private Thread loopThread;
 
     public ClaimLoop(
-            JobStore store, JobRunner runner, LeaseKeeper leases, WorkerProperties properties, WorkerIdentity identity) {
+            JobStore store,
+            JobRunner runner,
+            LeaseKeeper leases,
+            WorkerProperties properties,
+            WorkerIdentity identity,
+            WorkerMetrics metrics) {
         this.store = store;
         this.runner = runner;
         this.leases = leases;
         this.properties = properties;
+        this.metrics = metrics;
         this.workerId = identity.id();
         this.slots = new Semaphore(properties.concurrency());
     }
@@ -100,7 +107,9 @@ public class ClaimLoop implements SmartLifecycle {
                 }
                 List<Job> claimed;
                 try {
+                    long startNanos = System.nanoTime();
                     claimed = store.claim(workerId, Math.min(free, properties.batchSize()), properties.leaseDuration());
+                    metrics.recordClaim(claimed, System.nanoTime() - startNanos);
                 } catch (DataAccessException e) {
                     slots.release(free);
                     log.warn("Claim query failed, will retry: {}", e.getMessage());
