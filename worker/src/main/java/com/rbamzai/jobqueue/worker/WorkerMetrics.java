@@ -25,20 +25,11 @@ public class WorkerMetrics {
     public enum Outcome { SUCCEEDED, RETRIED, DEAD, LEASE_LOST }
 
     private final MeterRegistry registry;
-    private final Timer claimLatency;
-    private final DistributionSummary claimBatchSize;
     private final Timer queueWait;
     private final Counter leasesLost;
 
     public WorkerMetrics(MeterRegistry registry) {
         this.registry = registry;
-        this.claimLatency = Timer.builder("jobqueue.claim.latency")
-                .description("Duration of one claim query")
-                .publishPercentileHistogram()
-                .register(registry);
-        this.claimBatchSize = DistributionSummary.builder("jobqueue.claim.batch.size")
-                .description("Jobs returned per claim query")
-                .register(registry);
         this.queueWait = Timer.builder("jobqueue.job.queue.wait")
                 .description("Time from when a job became runnable until a worker claimed it")
                 .publishPercentileHistogram()
@@ -48,9 +39,22 @@ public class WorkerMetrics {
                 .register(registry);
     }
 
-    public void recordClaim(List<Job> claimed, long elapsedNanos) {
-        claimLatency.record(elapsedNanos, NANOSECONDS);
-        claimBatchSize.record(claimed.size());
+    /**
+     * @param source postgres (polling), redis (claim by popped ids), or sweep (Redis mode's periodic
+     *               Postgres claim); elapsed covers only the Postgres query, not time spent waiting for work
+     */
+    public void recordClaim(String source, List<Job> claimed, long elapsedNanos) {
+        Timer.builder("jobqueue.claim.latency")
+                .description("Duration of one claim query")
+                .tag("source", source)
+                .publishPercentileHistogram()
+                .register(registry)
+                .record(elapsedNanos, NANOSECONDS);
+        DistributionSummary.builder("jobqueue.claim.batch.size")
+                .description("Jobs returned per claim query")
+                .tag("source", source)
+                .register(registry)
+                .record(claimed.size());
         for (Job job : claimed) {
             // updated_at was set by the claim, and both timestamps come from the database clock.
             Duration wait = Duration.between(job.runAt(), job.updatedAt());

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.rbamzai.jobqueue.common.Job;
 import com.rbamzai.jobqueue.common.JobStatus;
+import com.rbamzai.jobqueue.common.ReadyQueue;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
@@ -19,11 +20,13 @@ public class JobService {
     static final int DEFAULT_MAX_ATTEMPTS = 5;
 
     private final JobRepository repository;
+    private final ReadyQueue readyQueue;
     private final Counter created;
     private final Counter replayed;
 
-    public JobService(JobRepository repository, MeterRegistry registry) {
+    public JobService(JobRepository repository, ReadyQueue readyQueue, MeterRegistry registry) {
         this.repository = repository;
+        this.readyQueue = readyQueue;
         this.created = enqueueCounter(registry, "created");
         this.replayed = enqueueCounter(registry, "replayed");
     }
@@ -48,6 +51,8 @@ public class JobService {
                 repository.insert(request.type(), payload.toString(), priority, maxAttempts, delaySeconds, idempotencyKey);
         if (inserted.isPresent()) {
             created.increment();
+            // After the insert has committed: a worker that pops the id must be able to see the row.
+            readyQueue.offer(inserted.get());
             return new EnqueueResult(inserted.get(), true);
         }
 
@@ -80,7 +85,9 @@ public class JobService {
     }
 
     public Job retry(UUID id) {
-        return repository.requeueIfDead(id)
+        Job requeued = repository.requeueIfDead(id)
                 .orElseThrow(() -> new JobConflictException("only DEAD jobs can be retried; job is " + get(id).status()));
+        readyQueue.offer(requeued);
+        return requeued;
     }
 }

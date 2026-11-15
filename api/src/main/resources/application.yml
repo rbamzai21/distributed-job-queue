@@ -25,3 +25,5 @@ management:
 
 jobqueue:
   stats-refresh-interval: 5s
+  queue-mode: ${QUEUE_MODE:postgres}
+  redis-url: ${REDIS_URL:redis://localhost:6379}

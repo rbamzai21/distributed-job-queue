@@ -15,7 +15,7 @@ import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Component;
 
 /**
- * Polls Postgres for ready jobs and runs each one on its own virtual thread.
+ * Claims ready jobs from a {@link ClaimSource} and runs each one on its own virtual thread.
  *
  * <p>A semaphore caps in-flight jobs at {@code worker.concurrency}. The loop only claims as many jobs
  * as it has free slots, so a busy worker leaves the rest of the queue for other workers instead of
@@ -26,11 +26,10 @@ public class ClaimLoop implements SmartLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(ClaimLoop.class);
 
-    private final JobStore store;
+    private final ClaimSource source;
     private final JobRunner runner;
     private final LeaseKeeper leases;
     private final WorkerProperties properties;
-    private final WorkerMetrics metrics;
     private final String workerId;
     private final Semaphore slots;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -40,17 +39,15 @@ public class ClaimLoop implements SmartLifecycle {
     private Thread loopThread;
 
     public ClaimLoop(
-            JobStore store,
+            ClaimSource source,
             JobRunner runner,
             LeaseKeeper leases,
             WorkerProperties properties,
-            WorkerIdentity identity,
-            WorkerMetrics metrics) {
-        this.store = store;
+            WorkerIdentity identity) {
+        this.source = source;
         this.runner = runner;
         this.leases = leases;
         this.properties = properties;
-        this.metrics = metrics;
         this.workerId = identity.id();
         this.slots = new Semaphore(properties.concurrency());
     }
@@ -60,8 +57,8 @@ public class ClaimLoop implements SmartLifecycle {
         running = true;
         leases.start();
         loopThread = Thread.ofPlatform().name("claim-loop").start(this::loop);
-        log.info("Worker {} started (concurrency={}, batchSize={})",
-                workerId, properties.concurrency(), properties.batchSize());
+        log.info("Worker {} started (mode={}, concurrency={}, batchSize={})",
+                workerId, properties.queueMode(), properties.concurrency(), properties.batchSize());
     }
 
     /**
@@ -107,9 +104,7 @@ public class ClaimLoop implements SmartLifecycle {
                 }
                 List<Job> claimed;
                 try {
-                    long startNanos = System.nanoTime();
-                    claimed = store.claim(workerId, Math.min(free, properties.batchSize()), properties.leaseDuration());
-                    metrics.recordClaim(claimed, System.nanoTime() - startNanos);
+                    claimed = source.claim(Math.min(free, properties.batchSize()));
                 } catch (DataAccessException e) {
                     slots.release(free);
                     log.warn("Claim query failed, will retry: {}", e.getMessage());
@@ -118,7 +113,7 @@ public class ClaimLoop implements SmartLifecycle {
                 }
                 slots.release(free - claimed.size());
                 claimed.forEach(this::dispatch);
-                if (claimed.isEmpty()) {
+                if (claimed.isEmpty() && !source.waitsForWork()) {
                     pause();
                 }
             }

@@ -5,6 +5,7 @@ import com.rbamzai.jobqueue.common.JobRowMapper;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
@@ -75,16 +76,48 @@ public class JobStore {
                 .list();
     }
 
+    /**
+     * Claims specific jobs, the ones a worker just popped from the Redis ready set. Only rows that are
+     * still PENDING and due are taken; stale ids (cancelled, already claimed via the Postgres sweep) are
+     * silently skipped, which is what lets Redis be a best-effort index rather than a source of truth.
+     */
+    public List<Job> claimByIds(String workerId, Collection<UUID> ids, Duration lease) {
+        return jdbc.sql("""
+                        WITH next AS (
+                            SELECT id FROM jobs
+                            WHERE id IN (:ids) AND status = 'PENDING' AND run_at <= now()
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE jobs j
+                        SET status = 'RUNNING',
+                            attempts = j.attempts + 1,
+                            worker_id = :workerId,
+                            lease_id = gen_random_uuid(),
+                            lease_expires_at = now() + make_interval(secs => :leaseSeconds),
+                            updated_at = now()
+                        FROM next
+                        WHERE j.id = next.id
+                        RETURNING j.*
+                        """)
+                .param("ids", ids)
+                .param("workerId", workerId)
+                .param("leaseSeconds", seconds(lease))
+                .query(mapper)
+                .list();
+    }
+
     /** Hands leases back on shutdown so other workers can run the jobs now, not after the leases expire. */
-    public int releaseLeases(Collection<UUID> leaseIds) {
+    public List<Job> releaseLeases(Collection<UUID> leaseIds) {
         return jdbc.sql("""
                         UPDATE jobs
                         SET status = 'PENDING', run_at = now(), worker_id = NULL, lease_id = NULL,
                             lease_expires_at = NULL, last_error = 'released by worker shutdown', updated_at = now()
                         WHERE status = 'RUNNING' AND lease_id IN (:leaseIds)
+                        RETURNING *
                         """)
                 .param("leaseIds", leaseIds)
-                .update();
+                .query(mapper)
+                .list();
     }
 
     /**
@@ -133,8 +166,11 @@ public class JobStore {
                 == 1;
     }
 
-    /** Puts a failed job back in the queue, runnable again after {@code delay}. */
-    public boolean scheduleRetry(Job job, Duration delay, String error) {
+    /**
+     * Puts a failed job back in the queue, runnable again after {@code delay}. Returns the updated row,
+     * or empty if this worker no longer holds the lease.
+     */
+    public Optional<Job> scheduleRetry(Job job, Duration delay, String error) {
         return jdbc.sql("""
                         UPDATE jobs
                         SET status = 'PENDING',
@@ -145,13 +181,14 @@ public class JobStore {
                             last_error = :error,
                             updated_at = now()
                         WHERE id = :id AND status = 'RUNNING' AND lease_id = :leaseId
+                        RETURNING *
                         """)
-                        .param("id", job.id())
-                        .param("leaseId", job.leaseId())
-                        .param("delaySeconds", seconds(delay))
-                        .param("error", error)
-                        .update()
-                == 1;
+                .param("id", job.id())
+                .param("leaseId", job.leaseId())
+                .param("delaySeconds", seconds(delay))
+                .param("error", error)
+                .query(mapper)
+                .optional();
     }
 
     /** Moves a job to the dead-letter queue. */

@@ -4,32 +4,39 @@ A distributed job queue built from scratch: a REST API accepts jobs, PostgreSQL 
 and a pool of worker processes claims and runs them. Failed jobs retry with exponential backoff, and
 jobs that keep failing move to a dead-letter queue for inspection. Think of it as a small SQS or Celery.
 
-**Stack:** Java 21, Spring Boot 3, PostgreSQL 17, Flyway, Micrometer + Prometheus, Docker Compose,
-JUnit + Testcontainers.
+**Stack:** Java 21, Spring Boot 3, PostgreSQL 17, Redis 7, Flyway, Micrometer + Prometheus,
+Docker Compose, JUnit + Testcontainers, k6.
 
 ## Architecture
 
 ```
-            POST /jobs                       claim (SKIP LOCKED)
- client ──────────────►  api  ──INSERT──►  Postgres  ◄────────────  worker ×N
-            GET /jobs                        (jobs)   ─────────────►  ├─ email handler
-                                                       finish/retry   ├─ cpu handler
-                                                                      └─ flaky handler
+                                  ┌──────────── Postgres (jobs) ◄──── source of truth ─────┐
+            POST /jobs            │ INSERT                                                 │ claim by id /
+ client ──────────────►  api ─────┤                                                        │ SKIP LOCKED sweep
+            GET /jobs             │ ZADD (after commit)                                    │ finish / retry
+                                  └──────────► Redis  ──── BZPOPMIN ────────────────►  worker ×N
+                                              ready / delayed sets                    ├─ email, cpu, flaky,
+                                              (index only)                            └─ noop handlers
 ```
+
+In the default `postgres` mode there is no Redis step: workers poll Postgres with `SKIP LOCKED`.
+`QUEUE_MODE=redis` adds the fast path above.
 
 | Module | What it does |
 |---|---|
-| `common/` | `Job` model, row mapping, backoff calculation |
+| `common/` | `Job` model, row mapping, backoff calculation, the Redis ready-queue index |
 | `api/` | REST endpoints; runs the Flyway migrations on startup |
-| `worker/` | Claim loop, handler registry, retry/dead-letter logic |
+| `worker/` | Claim loop and claim sources (Postgres / Redis), handlers, leases, reaper, retry/dead-letter logic |
 | `db/migrations/` | Flyway SQL migrations |
+| `load-tests/` | k6 load script and the benchmark harness |
 
 ## Running it
 
 Requires Docker. Nothing else needs to be installed locally.
 
 ```bash
-docker compose up -d --build        # Postgres, the API on :8080, and 2 workers
+docker compose up -d --build                     # Postgres polling: Postgres, Redis, API on :8080, 2 workers
+QUEUE_MODE=redis docker compose up -d --build    # Redis fast path
 ```
 
 ```bash
@@ -83,6 +90,70 @@ heartbeat and reaper with its own connection pool, so one can be crashed without
 | `staleWorkerCannotHeartbeatOrFinishAJobThatWasReclaimed` | A worker that stalls past its lease can't extend or overwrite the new owner's run, even when the same worker reclaims the job |
 | `claimSkipsRowsLockedByAnotherTransactionInsteadOfBlocking` | `SKIP LOCKED` skips a row locked by another transaction instead of waiting on it |
 | `reaperDeadLettersJobsThatAreOutOfAttempts` | A job that keeps killing its worker ends up in the DLQ instead of looping forever |
+| `RedisModeIT.manyWorkersRunEveryJobExactlyOnce` | The same exactly-once guarantee on the Redis fast path |
+| `jobsMissingFromRedisAreFoundByThePostgresSweep` | A job committed to Postgres but never indexed in Redis (API crashed between the two) still runs |
+| `losingAllRedisDataLosesNoJobs` | Redis restarts empty mid-run; every job still completes |
+| `workersFallBackToPostgresWhenRedisGoesDown` | Redis dies mid-run; workers degrade to Postgres polling and finish every job |
+| `popsHighestPriorityFirstThenOldestFirst` | Redis hands out jobs in exactly the Postgres claim order |
+
+## Benchmarks: Redis fast path vs. Postgres polling
+
+Run with [`load-tests/benchmark.sh`](load-tests/benchmark.sh): the full Compose stack, k6 enqueueing
+through the real API, and the no-op handler so the numbers measure the queue rather than the work.
+Latency is enqueue-to-completion (`updated_at − created_at` of each `SUCCEEDED` row). Raw results are
+in [`load-tests/results/`](load-tests/results/).
+
+**Environment:** one Windows laptop, Docker Desktop with 8 CPUs and 8 GB shared by Postgres, Redis, the
+API, every worker and k6. Absolute numbers are laptop numbers; the comparisons between modes are the point.
+
+### Latency under steady load: 300 jobs/s for 30s, 2 workers (9,000 jobs each)
+
+| Claim path | p50 | p95 | p99 | Postgres tx/s |
+|---|---|---|---|---|
+| Postgres polling, 500ms interval (default) | 240 ms | 463 ms | 491 ms | 661 |
+| Postgres polling, 50ms interval | 16 ms | 49 ms | 101 ms | 688 |
+| **Redis fast path** | **8.5 ms** | **20 ms** | **37 ms** | 791 |
+
+Redis cuts p50 latency **28×** and p99 **13×** against the default polling interval, and still beats
+aggressive 50ms polling by 2–3× at p99. A blocked `BZPOPMIN` wakes the moment a job is enqueued, while
+a polling worker finds it, on average, half an interval later.
+
+### Database load while idle: 4 workers, empty queue, 30s
+
+| Claim path | Postgres tx/s |
+|---|---|
+| Postgres polling, 500ms | 13.8 |
+| Postgres polling, 50ms | 82.2 |
+| **Redis fast path** (5s safety sweep only) | **4.8** |
+
+Polling buys latency with database load: getting polling down to ~16ms p50 costs **17×** more idle
+transactions than Redis, and that cost grows linearly with the number of workers.
+
+### Drain throughput: 20,000-job backlog, median of 3 runs (jobs/s)
+
+| Workers | Postgres polling | Redis fast path |
+|---|---|---|
+| 1 | 1,206 | 734 |
+| 2 | **1,619** | 1,169 |
+| 4 | 1,388 | 966 |
+| 8 | 912 | 807 |
+
+**Redis does not help throughput, and costs 10–40%.** With a backlog, a polling worker never sleeps, so
+Redis's wake-up advantage disappears, while each Redis batch costs extra round trips (`BZPOPMIN`, then
+`ZPOPMIN`, then the Postgres claim) where polling needs one query. The same effect shows in the steady-load
+table: Redis claims jobs in smaller batches as they arrive, so it spends more Postgres transactions per job.
+
+**Throughput peaks at 2 workers here**, because the bottleneck is Postgres (one committed `UPDATE` per
+finished job) competing for the same 8 CPUs as up to 8 worker JVMs. Adding workers on the same machine
+adds contention, not capacity; measuring real horizontal scaling needs Postgres on its own host.
+
+**Methodology notes.** Single runs varied by up to ~40% (e.g. 824–1,353 jobs/s for the same
+configuration), so drain results are medians of 3 interleaved runs. One run in the first pass
+(Redis, 4 workers) stalled for ~5 minutes; it didn't reproduce in 4 later attempts and its worker logs
+were lost when the containers were recreated, so it's excluded and noted here rather than hidden.
+
+**Takeaway:** use the Redis path when latency matters and the queue is often idle or lightly loaded
+(user-facing jobs, notifications). For batch backlogs, plain `SKIP LOCKED` polling is simpler and faster.
 
 ## Design decisions
 
@@ -140,6 +211,22 @@ p99s with `histogram_quantile`. Job types come from API clients, so only registe
 metric tags (anything else is `unknown`); otherwise each typo would create a new time series. Queue wait
 is measured as `claimed_at − run_at` using database timestamps, so worker clock skew can't distort it.
 
+**Redis as an index, never the source of truth.** In Redis mode the API commits the job to Postgres,
+*then* adds its id to a Redis sorted set, and idle workers block on `BZPOPMIN` instead of polling. A
+popped id is claimed in Postgres with the same status checks as always, so Redis can be stale, lossy or
+down without breaking correctness:
+- *Ordering:* score is `-priority` and the member is `<zero-padded run_at ms>:<id>`. Redis sorts equal
+  scores by member, so pops come out highest priority first, then oldest first: the same order as the
+  Postgres claim query.
+- *Delayed jobs and retries* sit in a second sorted set scored by `run_at`; a Lua script run every 100ms
+  atomically moves due ones to the ready set.
+- *Lost index entries* (API crashed between commit and `ZADD`, a worker died holding popped ids, Redis
+  restarted empty) are caught by a periodic `SKIP LOCKED` sweep of Postgres. If a sweep finds work, the
+  worker keeps draining Postgres until it's empty, so recovery after a Redis wipe is fast.
+- *Redis outage:* workers fall back to plain Postgres polling and switch back on their own. Redis runs
+  with persistence off, since there's nothing in it worth persisting.
+- *Stale entries* (cancelled or already-claimed jobs) are dropped by the claim's `status = 'PENDING'` check.
+
 **Status as `TEXT` + `CHECK`** instead of a Postgres `ENUM`: same safety, and adding a status is a
 constraint change instead of `ALTER TYPE`.
 
@@ -148,4 +235,5 @@ constraint change instead of `ALTER TYPE`.
 - [x] Week 1: schema, enqueue/get/list API, `SKIP LOCKED` claim loop, handlers, backoff, dead-letter queue, Compose
 - [x] Week 2a: lease heartbeats, reaper, fencing tokens, graceful lease release, idempotency keys, cancel/retry
 - [x] Week 2b: Testcontainers crash and concurrency tests, Micrometer + Prometheus metrics, `GET /stats`
-- [ ] Week 3: Redis fast path, Redis vs. Postgres claiming benchmark, k6 load tests, React dashboard, AWS deploy
+- [x] Week 3a: Redis fast path with Postgres fallback, k6 load tests, Redis vs. Postgres benchmark
+- [ ] Week 3b: React dashboard, AWS deploy (with Postgres on its own host, to measure real scaling)

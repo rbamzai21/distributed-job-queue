@@ -62,16 +62,21 @@ abstract class PostgresTestSupport {
     }
 
     UUID enqueue(String type, int priority, int maxAttempts, long delaySeconds) {
+        return insertJob(type, priority, maxAttempts, delaySeconds).id();
+    }
+
+    /** Inserts a PENDING job, like the API does, and returns the row. */
+    Job insertJob(String type, int priority, int maxAttempts, double delaySeconds) {
         return jdbc.sql("""
                         INSERT INTO jobs (type, priority, max_attempts, run_at)
                         VALUES (:type, :priority, :maxAttempts, now() + make_interval(secs => :delay))
-                        RETURNING id
+                        RETURNING *
                         """)
                 .param("type", type)
                 .param("priority", priority)
                 .param("maxAttempts", maxAttempts)
-                .param("delay", (double) delaySeconds)
-                .query(UUID.class)
+                .param("delay", delaySeconds)
+                .query(MAPPER)
                 .single();
     }
 

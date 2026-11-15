@@ -3,9 +3,16 @@ x-db-env: &db-env
   DB_USER: ${POSTGRES_USER:-jobqueue}
   DB_PASSWORD: ${POSTGRES_PASSWORD:-jobqueue}
 
+# QUEUE_MODE=redis switches the API and workers to the Redis fast path; the default is Postgres polling.
+x-queue-env: &queue-env
+  QUEUE_MODE: ${QUEUE_MODE:-postgres}
+  REDIS_URL: redis://redis:6379
+
 services:
   postgres:
     image: postgres:17
+    # Each worker pools up to 12 connections; the default of 100 runs out at 8 workers + the API.
+    command: ["postgres", "-c", "max_connections=200"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-jobqueue}
       POSTGRES_USER: ${POSTGRES_USER:-jobqueue}
@@ -20,16 +27,32 @@ services:
       timeout: 3s
       retries: 20
 
+  # Only an index of runnable job ids. Persistence is deliberately off: losing it loses no jobs,
+  # because Postgres is the source of truth and workers sweep Postgres for anything Redis misses.
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
   api:
     build:
       context: .
       args:
         MODULE: api
-    environment: *db-env
+    environment:
+      <<: [*db-env, *queue-env]
     ports:
       - "8080:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   worker:
@@ -38,15 +61,18 @@ services:
       args:
         MODULE: worker
     environment:
-      <<: *db-env
-      WORKER_CONCURRENCY: 8
+      <<: [*db-env, *queue-env]
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-500ms}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       api:
         condition: service_started  # the API runs the migrations
     deploy:
-      replicas: 2
+      replicas: ${WORKERS:-2}
     # Must exceed worker.shutdown-timeout so in-flight jobs can finish on SIGTERM.
     stop_grace_period: 40s
 

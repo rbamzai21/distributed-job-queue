@@ -144,12 +144,28 @@ class JobStoreIT extends PostgresTestSupport {
         assertThat(job(poisonPill).lastError()).startsWith("lease expired on worker A");
     }
 
+    /** Redis entries can be stale; claiming by id must only take rows that are still PENDING and due. */
+    @Test
+    void claimByIdsSkipsJobsThatAreNotPendingOrNotDue() {
+        UUID ready = enqueue("t");
+        UUID delayed = enqueue("t", 0, 5, 3600);
+        UUID alreadyClaimed = enqueue("t", 100, 5, 0);
+        store.claim("other", 1, LEASE);
+
+        List<Job> claimed = store.claimByIds("w1", List.of(ready, delayed, alreadyClaimed, UUID.randomUUID()), LEASE);
+
+        assertThat(claimed).extracting(Job::id).containsExactly(ready);
+        assertThat(job(alreadyClaimed).workerId()).isEqualTo("other");
+    }
+
     @Test
     void releasedLeasesAreImmediatelyClaimableByOthers() {
         UUID id = enqueue("t");
         Job claimed = store.claim("A", 1, LEASE).getFirst();
 
-        assertThat(store.releaseLeases(List.of(claimed.leaseId()))).isEqualTo(1);
+        assertThat(store.releaseLeases(List.of(claimed.leaseId())))
+                .singleElement()
+                .satisfies(released -> assertThat(released.status()).isEqualTo(JobStatus.PENDING));
 
         assertThat(store.claim("B", 1, LEASE)).extracting(Job::id).containsExactly(id);
         assertThat(store.markSucceeded(claimed)).isFalse();

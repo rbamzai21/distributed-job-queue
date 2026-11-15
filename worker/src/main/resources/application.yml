@@ -8,6 +8,10 @@ spring:
     hikari:
       # One connection for the claim loop, heartbeat and reaper, plus one per in-flight job finishing up.
       maximum-pool-size: ${WORKER_DB_POOL_SIZE:12}
+  task:
+    scheduling:
+      pool:
+        size: 2  # reaper and (in Redis mode) the delayed-job promoter, so neither waits on the other
 
 server:
   port: 8081  # actuator only: health and the Prometheus scrape endpoint
@@ -22,12 +26,16 @@ management:
       application: worker
 
 worker:
+  queue-mode: ${QUEUE_MODE:postgres}
   concurrency: ${WORKER_CONCURRENCY:8}
-  batch-size: 10
-  poll-interval: 500ms
+  batch-size: ${WORKER_BATCH_SIZE:10}
+  poll-interval: ${WORKER_POLL_INTERVAL:500ms}
   lease-duration: 30s
   heartbeat-interval: 10s
   reaper-interval: 5s
   backoff-base: 1s
   backoff-max: 5m
   shutdown-timeout: 30s
+  redis-url: ${REDIS_URL:redis://localhost:6379}
+  redis-sweep-interval: 5s
+  promote-interval: 100ms

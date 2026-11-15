@@ -3,6 +3,7 @@ package com.rbamzai.jobqueue.worker;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import com.rbamzai.jobqueue.common.Job;
+import com.rbamzai.jobqueue.common.ReadyQueue;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -29,14 +30,16 @@ public class LeaseKeeper {
     private static final Logger log = LoggerFactory.getLogger(LeaseKeeper.class);
 
     private final JobStore store;
+    private final ReadyQueue readyQueue;
     private final WorkerProperties properties;
     private final WorkerMetrics metrics;
     private final Set<UUID> heldLeases = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("lease-heartbeat").factory());
 
-    public LeaseKeeper(JobStore store, WorkerProperties properties, WorkerMetrics metrics) {
+    public LeaseKeeper(JobStore store, ReadyQueue readyQueue, WorkerProperties properties, WorkerMetrics metrics) {
         this.store = store;
+        this.readyQueue = readyQueue;
         this.properties = properties;
         this.metrics = metrics;
         metrics.registerInFlight(heldLeases, Set::size);
@@ -62,7 +65,12 @@ public class LeaseKeeper {
     /** Releases every lease still held. Called on shutdown for jobs that didn't finish in time. */
     public int releaseAll() {
         List<UUID> leases = List.copyOf(heldLeases);
-        return leases.isEmpty() ? 0 : store.releaseLeases(leases);
+        if (leases.isEmpty()) {
+            return 0;
+        }
+        List<Job> released = store.releaseLeases(leases);
+        released.forEach(readyQueue::offer);
+        return released.size();
     }
 
     private void heartbeat() {

@@ -2,6 +2,7 @@ package com.rbamzai.jobqueue.worker;
 
 import com.rbamzai.jobqueue.common.Backoff;
 import com.rbamzai.jobqueue.common.Job;
+import com.rbamzai.jobqueue.common.ReadyQueue;
 import com.rbamzai.jobqueue.worker.WorkerMetrics.Outcome;
 import com.rbamzai.jobqueue.worker.handler.HandlerRegistry;
 import com.rbamzai.jobqueue.worker.handler.JobHandler;
@@ -22,12 +23,15 @@ public class JobRunner {
     private final HandlerRegistry handlers;
     private final JobStore store;
     private final Backoff backoff;
+    private final ReadyQueue readyQueue;
     private final WorkerMetrics metrics;
 
-    public JobRunner(HandlerRegistry handlers, JobStore store, Backoff backoff, WorkerMetrics metrics) {
+    public JobRunner(
+            HandlerRegistry handlers, JobStore store, Backoff backoff, ReadyQueue readyQueue, WorkerMetrics metrics) {
         this.handlers = handlers;
         this.store = store;
         this.backoff = backoff;
+        this.readyQueue = readyQueue;
         this.metrics = metrics;
     }
 
@@ -68,9 +72,11 @@ public class JobRunner {
             return Outcome.DEAD;
         }
         Duration delay = backoff.delayFor(job.attempts());
-        if (!store.scheduleRetry(job, delay, error)) {
+        Optional<Job> retrying = store.scheduleRetry(job, delay, error);
+        if (retrying.isEmpty()) {
             return lostLease(job, "failure");
         }
+        readyQueue.offer(retrying.get());
         log.info("Job {} ({}) failed attempt {}/{}, retrying in {} ms: {}",
                 job.id(), job.type(), job.attempts(), job.maxAttempts(), delay.toMillis(), error);
         return Outcome.RETRIED;

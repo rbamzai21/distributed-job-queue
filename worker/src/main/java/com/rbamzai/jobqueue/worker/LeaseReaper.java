@@ -2,6 +2,7 @@ package com.rbamzai.jobqueue.worker;
 
 import com.rbamzai.jobqueue.common.Job;
 import com.rbamzai.jobqueue.common.JobStatus;
+import com.rbamzai.jobqueue.common.ReadyQueue;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,10 +21,12 @@ public class LeaseReaper {
     private static final int BATCH_SIZE = 100;
 
     private final JobStore store;
+    private final ReadyQueue readyQueue;
     private final WorkerMetrics metrics;
 
-    public LeaseReaper(JobStore store, WorkerMetrics metrics) {
+    public LeaseReaper(JobStore store, ReadyQueue readyQueue, WorkerMetrics metrics) {
         this.store = store;
+        this.readyQueue = readyQueue;
         this.metrics = metrics;
     }
 
@@ -34,6 +37,7 @@ public class LeaseReaper {
             do {
                 reaped = store.reapExpiredLeases(BATCH_SIZE);
                 if (!reaped.isEmpty()) {
+                    reaped.stream().filter(job -> job.status() == JobStatus.PENDING).forEach(readyQueue::offer);
                     long dead = reaped.stream().filter(job -> job.status() == JobStatus.DEAD).count();
                     long requeued = reaped.size() - dead;
                     metrics.recordReaped(requeued, dead);
