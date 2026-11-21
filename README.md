@@ -1,4 +1,4 @@
-# job-queue
+# Distributed Job Queue
 
 A distributed job queue built from scratch: a REST API accepts jobs, PostgreSQL stores them durably,
 and a pool of worker processes claims and runs them. Failed jobs retry with exponential backoff, and
@@ -236,12 +236,3 @@ down without breaking correctness:
 
 **Status as `TEXT` + `CHECK`** instead of a Postgres `ENUM`: same safety, and adding a status is a
 constraint change instead of `ALTER TYPE`.
-
-## Roadmap
-
-- [x] Week 1: schema, enqueue/get/list API, `SKIP LOCKED` claim loop, handlers, backoff, dead-letter queue, Compose
-- [x] Week 2a: lease heartbeats, reaper, fencing tokens, graceful lease release, idempotency keys, cancel/retry
-- [x] Week 2b: Testcontainers crash and concurrency tests, Micrometer + Prometheus metrics, `GET /stats`
-- [x] Week 3a: Redis fast path with Postgres fallback, k6 load tests, Redis vs. Postgres benchmark
-- [x] Week 3b: React dashboard
-- [ ] Week 3c: AWS deploy (with Postgres on its own host, to measure real scaling)
